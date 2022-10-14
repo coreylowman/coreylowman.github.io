@@ -35,6 +35,10 @@ fn do_something<const K: usize, T>(a: f32, t: T) -> T {
     todo!();
 }
 
+fn a_lifetime_function<'a>(something: &'a f32) {
+    println!("{:?}", a);
+}
+
 fn main() {
     // this is a comment
     let q: Tensor2D<3, 5, OwnedTape> = TensorCreator::zeros();
