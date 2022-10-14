@@ -44,6 +44,7 @@ fn main() {
     let q: Tensor2D<3, 5, OwnedTape> = TensorCreator::zeros();
     let r = q.sin() + 1.2345;
     println!("hello world");
+    a_lifetime_function::<'static>(&-0.234);
 }
 ```
 
