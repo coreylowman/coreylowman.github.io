@@ -1,3 +1,6 @@
 theme: jekyll-theme-slate
-title: dfdx blog
-description: Blog for dfdx updates
+title: a blog
+description: a good description
+kramdown:
+  syntax_highlighter_opts:
+    disable: true
