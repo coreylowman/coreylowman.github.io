@@ -10,11 +10,10 @@ You can find the documentation at [docs.rs/dfdx](https://docs.rs/dfdx/).
 
 # All Posts
 
-{% assign doclist = site.pages | sort: 'url'  %}
 <ul>
-    {% for doc in doclist %}
-        {% if doc.name contains '.md' %}
-            <li><a href="{{ site.baseurl }}{{ doc.url }}">{{ doc.url }}</a></li>
+    {% for page in site.posts %}
+        {% if page.name contains '.md' %}
+            <li><a href="{{page.url}}">{{page.title}}</a></li>
         {% endif %}
     {% endfor %}
 </ul>
