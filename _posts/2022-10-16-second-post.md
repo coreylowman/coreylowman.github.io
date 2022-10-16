@@ -1,5 +1,4 @@
 ---
-layout: post
 title: "2nd post"
 ---
 
