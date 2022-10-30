@@ -1,5 +1,5 @@
 ---
-title: "Announcing dfdx - an deep learning library built with const generics"
+title: "Announcing dfdx"
 ---
 
 Links: [github](https://github.com/coreylowman/dfdx), [crates.io/dfdx](https://crates.io/crates/dfdx), [docs.rs/dfdx](https://docs.rs/dfdx/latest/dfdx/)
