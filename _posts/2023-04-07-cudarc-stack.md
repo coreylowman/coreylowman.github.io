@@ -149,85 +149,79 @@ A number of things are going on here:
 
 # Launching cuda kernels
 
-Now that we know how to compile & load a PTX file into a cuda device, we can actually submit this kernel to the GPU!
+Now that we know how to compile & load a PTX file into a cuda device, we can actually submit this kernel to the GPU.
 
 1. Retrieve the already loaded function:
-```rust
-let as_kernel = dev.get_func(&module_name, "as_kernel").unwrap();
-```
+    ```rust
+    let as_kernel = dev.get_func(&module_name, "as_kernel").unwrap();
+    ```
 
 2. Allocate space for output - we are specifically not setting the memory here for performance reasons and because the kernel we are about to launch will set all the memory.
-```rust
-let n: usize = inp.data.len();
-let mut out = unsafe { dev.alloc::<E2>(n) }?;
-```
+    ```rust
+    let n: usize = inp.data.len();
+    let mut out = unsafe { dev.alloc::<E2>(n) }?;
+    ```
 
-3. Configure the grid/block dimensions for cuda & the arguments for the kernel
-```rust
-// set up the arguments to the function to pass to the kernel
-let cfg = launch_cfg(n as u32);
-let args = (
-    n,                 // `usize` <=> `const size_t n`
-    inp.data.as_ref(), // `&CudaSlice<E1>` <=> `const E1 *inp`
-    &mut out           // `&mut CudaSlice<E2>` <=> `E2 * out`
-);
-```
+3. Configure the grid/block dimensions for cuda (the equivalent of the `<<<...>>>` in c++) & the arguments for the kernel
+    ```rust
+    let cfg = launch_cfg(n as u32);
+    let args = (
+        n,                 // `usize` <=> `const size_t n`
+        inp.data.as_ref(), // `&CudaSlice<E1>` <=> `const E1 *inp`
+        &mut out           // `&mut CudaSlice<E2>` <=> `E2 * out`
+    );
+    ```
 
 4. Launch it!
-```rust
-// Asynchronously launch the kernel
-unsafe { as_kernel.launch(cfg, args) }?;
-```
+    ```rust
+    unsafe { as_kernel.launch(cfg, args) }?;
+    ```
 
-# Generics across FFI
+# Handling generics across FFI
 
-`dfdx` heavily uses generics everywhere. The data type of tensors (dtype) is a generic type, meaning all the low level kernels are also generic over the dtype. We also know that c++ has generics via templates. Should be easy to use on both sides (rust and c++) right? **Nope!** Since we are using FFI, we need to annotate all kernel methods with `extern "C"`. You actually [cannot use `extern "C"` together with templates](https://stackoverflow.com/questions/4877705/why-cant-templates-be-within-extern-c-blocks)!
+`dfdx` heavily uses generics everywhere, including the kernels. We also know that c++ has generics via templates. Should be easy to use on both sides (rust and c++) right? **Nope!** Since we are using FFI, we need to annotate all kernel methods with `extern "C"`. You actually [cannot use `extern "C"` together with templates](https://stackoverflow.com/questions/4877705/why-cant-templates-be-within-extern-c-blocks)!
 
-To be clear, you can write the following kernel, but the name of this function will be mangled because of the typename:
+To be clear, you can write the following kernel, but the name of this function will be mangled because of the template, which means you won't be able to use it with ffi:
 ```c++
 template<typename T>
 __global__ void kernel(const T *inp, T *out, int numel) { ... }
 ```
 
-To use with FFI in rust, you need to add `extern "C"` to all the kernels.
-
 There are two ways to handle this:
 
-1. Add an `extern "C"` kernel that calls into a generic kernel for each data type you need
-2. JIT compile a kernel with the types inserted in at runtime.
+1. Add an `extern "C"` kernel that calls into a generic kernel for each data type you need. This works pretty well for majority of cases, but is very cumbersome.
+    ```c++
+    template<typename T>
+    __device__ void kernel(const T *inp, T *out, int numel) { ... }
 
-The first option looks like the below on the cuda side:
-```c++
-template<typename T>
-__device__ void kernel(const T *inp, T *out, int numel) { ... }
+    extern "C" __global__ void kernel_f32(const float *inp, float *out, int numel) { kernel(inp, out, numel) }
+    extern "C" __global__ void kernel_f64(const double *inp, double *out, int numel) { kernel(inp, out, numel) }
+    ```
 
-extern "C" __global__ void kernel_f32(const float *inp, float *out, int numel) { kernel(inp, out, numel) }
-extern "C" __global__ void kernel_f64(const double *inp, double *out, int numel) { kernel(inp, out, numel) }
-```
+2. JIT compile a kernel with the types inserted in at runtime, which is what we did with the `as` kernel above.
 
-This works for a majority of cases, but is very repetitive.
-
-I'll discuss the second option more below.
-
+Those have been sufficient so far! I'm sure it will evolve more as we add more dtypes like `f16`.
 
 # Testing
 
-So how do we test all this? `dfdx` already had extensive unit testing on all tensor operations, but this essentially doubled the amount of code to cover for each operation (because we have Cpu kernels and Cuda kernels). Luckily we still have generics!
+So how do we test all this? `dfdx` already had extensive unit testing on all tensor operations, but this essentially doubled the amount of code to cover for each operation (because we have kernels for both Cpu and Cuda). Luckily nothing stops us from writing our unit tests as generic!
 
-`dfdx` has a special `TestDevice` type that can be configured with feature flags:
+`dfdx` has a special type alias called `TestDevice` that can be configured with feature flags:
 
 ```rust
-#[cfg(not(feature = "cuda"))]
-pub type TestDevice = crate::tensor::Cpu;
-
-#[cfg(feature = "cuda")]
-pub type TestDevice = crate::tensor::Cuda;
+#[cfg(test)]
+mod tests {
+    #[cfg(not(feature = "cuda"))]
+    pub type TestDevice = crate::tensor::Cpu;
+    
+    #[cfg(feature = "cuda")]
+    pub type TestDevice = crate::tensor::Cuda;
+}
 ```
 
 As long as the unit tests are written using this TestDevice type, we can easily switch between what type of kernel we are testing. This is super useful because it forces all the unit tests to be written in a generic way, which is much closer to how I expect users to write code as well.
 
-Here's an example of the `square` operation which square's every value:
-
+Here's an example of the `x^2` operation:
 ```rust
 #[test]
 fn test_square() {
@@ -235,8 +229,8 @@ fn test_square() {
     let x: Tensor<_, TestDtype, _> = dev.tensor([-2.0, -1.0, 0.0, 1.0, 2.0]);
     let r = x.leaky_trace().square();
     assert_eq!(r.array(), [4.0, 1.0, 0.0, 1.0, 4.0]);
-    let g = r.mean().backward();
-    assert_eq!(g.get(&x).array(), [-0.8, -0.4, 0.0, 0.4, 0.8]);
+    let gradients = r.mean().backward();
+    assert_eq!(gradients.get(&x).array(), [-0.8, -0.4, 0.0, 0.4, 0.8]);
 }
 ```
 
