@@ -17,7 +17,7 @@ GPU Acceleration with CUDA was recently added into dfdx. In this post I'll dive 
 
 # What is a CUDA kernel?
 
-Basically: a normal function. Behind the scenes it is executed on massively GPUs that are organized into thousands of groups of threads. Here's what a simple cuda kernel looks like in code:
+Basically: a function. Behind the scenes it is executed on massively GPUs that are organized into thousands of groups of threads. Here's what a simple cuda kernel looks like in code:
 
 ```c++
 extern "C" __global__ void sin_kernel(const size_t n, const float *inp, float *out) {
@@ -63,33 +63,30 @@ There are two problems to solve here:
 The answer to both of these is a build script (`build.rs`)! It turns out to be quite simple actually; dfdx's `build.rs` file does the following:
 1. Glob for all `*.cu` files in the dfdx repo.
 
-```rust
-let kernel_paths: Vec<std::path::PathBuf> = glob::glob("src/**/*.cu")
-    .unwrap()
-    .map(|p| p.unwrap())
-    .collect();
-```
+    ```rust
+    let kernel_paths: Vec<std::path::PathBuf> = glob::glob("src/**/*.cu")
+        .unwrap()
+        .map(|p| p.unwrap())
+        .collect();
+    ```
 
 2. Invokes nvidia's kernel compiler `nvcc` on each individual cu file using `std::process`.
-    a. These are saved into the `$OUT_DIR` directory, which is a [special build.rs environment variable](https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts).
-    b. The saved file's extension will be `.ptx` (important for later).
+    1. These are saved into the `$OUT_DIR` directory, which is a [special build.rs environment variable](https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts).
+    2. The saved file's extension will be `.ptx` (important for later).
 
-```rust
-kernel_paths
-    .iter()
-    .map(|p| {
-        std::process::Command::new("nvcc")
-            .arg(format!("--gpu-architecture=sm_{compute_cap}"))
-            .arg("--ptx")
-            .args(["--default-stream", "per-thread"])
-            .args(["--output-directory", &out_dir])
-            .args(&include_options)
-            .arg(p)
-            .spawn()
-            .unwrap()
-    })
-    .collect::<Vec<_>>()
-```
+    ```rust
+    kernel_paths
+        .iter()
+        .map(|kernel_path| {
+            std::process::Command::new("nvcc")
+                .arg("--ptx")
+                .args(["--output-directory", &std::env::var("OUT_DIR").unwrap()])
+                .arg(kernel_path)
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>()
+    ```
 
 That's it for compiling ptx files!
 
@@ -102,10 +99,10 @@ const PTX_SRC: &str = include_str!(concat!(env!("OUT_DIR"), "/conv2d.ptx"));
 ```
 
 Each piece of this is important, so starting from the inner most out:
-1. [env!](https://doc.rust-lang.org/std/macro.env.html) "Inspects an environment variable at compile time.", meaning it will have the same value of `$OUT_DIR` that was used in `build.rs`
-2. [concat!](https://doc.rust-lang.org/std/macro.concat.html) concatenates two string literals. So the result of this is `"$OUT_DIR/conv2d.ptx"` in this case.
+1. [env!(...)](https://doc.rust-lang.org/std/macro.env.html) "Inspects an environment variable at compile time.", meaning it will have the same value of `$OUT_DIR` that was used in `build.rs`
+2. [concat!(...)](https://doc.rust-lang.org/std/macro.concat.html) concatenates two string literals. So the result of this is `"$OUT_DIR/conv2d.ptx"` in this case.
     a. Since we know the saved file is just the name of the `.cu` file replaced with `.ptx`, we know this will exist.
-3. [include_str!](https://doc.rust-lang.org/std/macro.include_str.html) includes the contents of a file **at compile time**. This means we are embedding the compiled `.ptx` file into our rust source code!
+3. [include_str!(...)](https://doc.rust-lang.org/std/macro.include_str.html) includes the contents of a file **at compile time**. This means we are embedding the compiled `.ptx` file into our rust source code!
 
 To actually load this ptx into the device, you'll see code like:
 ```rust
@@ -118,7 +115,11 @@ Which converts the `PTX_SRC` into a [cudarc::nvrtc::Ptx](https://docs.rs/cudarc/
 
 We can also JIT compile kernels at runtime. This path is actually much easier code wise, but the first invocation of the kernel will involve compiling as well.
 
-First we'll just include the contents of the kernel as a const str. The example converts between two types (e.g. its like the `as` keyword in rust, but for tensors). Note that the two types of inputs are `$Src` and `$Dst`, which aren't actual c++ types:
+To show off why you might go with this path instead of nvcc, I'll use a special kernel as an example. This kernel is the equivalent of the `as` keyword in rust: it converts between types! Notably, it has to support **every** pair of types that we might want to run with. This is super cumbersome if we go with nvcc due to generics as I'll get into later.
+
+`nvrtc` is powerful, because we can have "pseudo" generic kernels that we compile for each type we need at runtime.
+
+Here's the source code for the kernel as a rust global const. Note the types of the input:
 
 ```rust
 const AS_KERNEL: &str = "
@@ -130,13 +131,13 @@ extern \"C\" __global__ void as_kernel(const size_t n, const $Src *inp, $Dst *ou
 }";
 ```
 
-At runtime, we can dynamically create and load the module into Cuda like so:
+At runtime, we can dynamically create and load the module into Cuda like so, where `E1` is the source's type, and `E2` is the destination type.
 ```rust
 let module_name = std::format!("convert_{}_to_{}", E1::NAME, E2::NAME);
 if !dev.has_func(&module_name, "as_kernel") {
     let src = AS_KERNEL.replace("$Src", E1::NAME).replace("$Dst", E2::NAME);
     let ptx = compile_ptx(src).unwrap();
-    dev.load_ptx(ptx, &module_name, &["kernel"])?;
+    dev.load_ptx(ptx, &module_name, &["as_kernel"])?;
 }
 ```
 
@@ -152,7 +153,7 @@ Now that we know how to compile & load a PTX file into a cuda device, we can act
 
 1. Retrieve the already loaded function:
 ```rust
-let fwd_fn = dev.get_func(&module_name, "kernel").unwrap();
+let as_kernel = dev.get_func(&module_name, "as_kernel").unwrap();
 ```
 
 2. Allocate space for output - we are specifically not setting the memory here for performance reasons and because the kernel we are about to launch will set all the memory.
@@ -175,7 +176,7 @@ let args = (
 4. Launch it!
 ```rust
 // Asynchronously launch the kernel
-unsafe { fwd_fn.launch(cfg, args) }?;
+unsafe { as_kernel.launch(cfg, args) }?;
 ```
 
 # Generics across FFI
@@ -243,4 +244,4 @@ You also might notice a `TestDtype` type which can be used to test `f64` instead
 
 # Thanks
 
-A big thanks to all my sponsors, including: @jackvial, @TimerErTim, @paholg, @scooter, @zeroows, @iExalt, @quietlychris, @skinner, @Michael P, @Alex R., @Rahul T.
+A big thanks to all my sponsors, including: @jackvial, @TimerErTim, @paholg, @scooter, @zeroows, @iExalt, @quietlychris, @skinner, @Michael P, @Alex R., @rahul-tuli.
