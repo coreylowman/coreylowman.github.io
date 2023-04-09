@@ -2,7 +2,7 @@
 title: "A look into how dfdx compiles & uses cuda kernels"
 ---
 
-# Table of contents
+# Intro
 
 Join the [dfdx discord](https://discord.gg/HwaNMuHa) to stay in the loop!
 
@@ -20,28 +20,37 @@ GPU Acceleration with CUDA was recently added into dfdx. In this post I'll dive 
 Basically: a function. Behind the scenes it is executed on massively GPUs that are organized into thousands of groups of threads. Here's what a simple cuda kernel looks like in code:
 
 ```c++
-extern "C" __global__ void sin_kernel(const size_t n, const float *inp, float *out) {
+extern "C" __global__ void sin_kernel(
+    const size_t num_elements,
+    const float *inp,
+    float *out
+) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
+    if (i < num_elements) {
         out[i] = sinf(inp[i]);
     }
 }
 ```
 
+The `extern "C"` is necessary to interact with this function across FFI, and the `__global__` is a CUDA specific thing that indicates it is a kernel.
+
 That's all the introduction I'll give for now, as the rest of this post just focuses on how to interact with these from rust. The details of writing kernels is for another time.
 
-# How do you use them from not c++?
+# How to call kernels from rust
 
 Most of the CUDA examples you'll see will invoke these kernels directly in c++, often with these crazy bracket symbols:
 ```c++
 sin_kernel<<<12, 34>>>(12, ...)
 ```
 
-But since we are using rust, we can't do that. Instead we'll go through nvidia's CUDA toolkit api to load a module with [cuModuleLoadData](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MODULE.html#group__CUDA__MODULE_1g04ce266ce03720f479eab76136b90c0b), which states:
+But since we are using rust, we can't do that. Instead we'll go through nvidia's CUDA toolkit api. There's a couple parts to this:
 
-> Takes a pointer image and loads the corresponding module module into the current context. The pointer may be obtained by mapping a cubin or PTX or fatbin file, **passing a cubin or PTX or fatbin file as a NULL-terminated text string**, or incorporating a cubin or fatbin object into the executable resources and using operating system calls such as Windows FindResource() to obtain the pointer. 
+1. Compile a cu file to a PTX file
+1. Load a PTX file with [cuModuleLoadData](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MODULE.html#group__CUDA__MODULE_1g04ce266ce03720f479eab76136b90c0b):
+2. Retrieve a function from the module with [cuModuleGetFunction](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MODULE.html#group__CUDA__MODULE_1ga52be009b0d4045811b30c965e1cb2cf)
+3. Invoking the function with [cuLaunchKernel](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1gb8f3dc3031b40da29d5f9a7139e52e15).
 
-This means if we can compile these cuda kernels into a PTX file, then we can give the content of the PTX to this function! Now we just need to figure out how to compile these PTX objects.
+[cudarc](https://docs.rs/cudarc/latest/cudarc/) makes these relatively straightforward, and has safe wrappers for all the above. So really the only part to figure out is how to compile the PTX files.
 
 # Compiling CUDA Kernels
 
@@ -51,14 +60,14 @@ There are two methods for compiling `.cu` files to `.ptx` files:
 
 `dfdx` actually uses both methods in the codebase in different situations. Let's dive into them!
 
-## At compile time with `nvcc`
+## At compile time with nvcc
 
 There are two problems to solve here:
 
 1. How do we invoke nvidia's kernel compiler `nvcc` at compile time?
 2. How do we gain access to the output in the source code?
 
-### Running `nvcc` in a build script
+### Running nvcc in a build script
 
 The answer to both of these is a build script (`build.rs`)! It turns out to be quite simple actually; dfdx's `build.rs` file does the following:
 1. Glob for all `*.cu` files in the dfdx repo.
@@ -80,7 +89,10 @@ The answer to both of these is a build script (`build.rs`)! It turns out to be q
         .map(|kernel_path| {
             std::process::Command::new("nvcc")
                 .arg("--ptx")
-                .args(["--output-directory", &std::env::var("OUT_DIR").unwrap()])
+                .arg([
+                    "--output-directory",
+                    &std::env::var("OUT_DIR").unwrap()
+                ])
                 .arg(kernel_path)
                 .spawn()
                 .unwrap()
@@ -92,7 +104,7 @@ That's it for compiling ptx files!
 
 ### Inserting file contents into rust source code
 
-As far as using the output of these, you'll find this snippet all around the dfdx cuda kernels:
+As far as using the resulting PTX file, you'll find this snippet all around the dfdx cuda kernels:
 
 ```rust
 const PTX_SRC: &str = include_str!(concat!(env!("OUT_DIR"), "/conv2d.ptx"));
@@ -104,18 +116,18 @@ Each piece of this is important, so starting from the inner most out:
     a. Since we know the saved file is just the name of the `.cu` file replaced with `.ptx`, we know this will exist.
 3. [include_str!(...)](https://doc.rust-lang.org/std/macro.include_str.html) includes the contents of a file **at compile time**. This means we are embedding the compiled `.ptx` file into our rust source code!
 
-To actually load this ptx into the device, you'll see code like:
+Finally we can use [CudaDevice::load_ptx()](https://docs.rs/cudarc/latest/cudarc/driver/safe/struct.CudaDevice.html#method.load_ptx) to invoke `cuModuleLoadData`:
 ```rust
 self.dev.load_ptx(PTX_SRC.into(), Self::MOD, Self::FNS)?;
 ```
 
-Which converts the `PTX_SRC` into a [cudarc::nvrtc::Ptx](https://docs.rs/cudarc/0.9.6/cudarc/nvrtc/safe/struct.Ptx.html) object, and then uses [cudarc::driver::CudaDevice::load_ptx](https://docs.rs/cudarc/0.9.6/cudarc/driver/safe/struct.CudaDevice.html#method.load_ptx) to load this module into Cuda.
+Now that the kernel's PTX is loaded into the device, we can call into it. But first a detour on JIT compilation.
 
-## JIT compiling at run-time with `nvrtc`
+## JIT compiling at run-time with nvrtc
 
-We can also JIT compile kernels at runtime. This path is actually much easier code wise, but the first invocation of the kernel will involve compiling as well.
+We can also JIT compile kernels at runtime. This path is actually much simpler code wise, since it doesn't need the build script. It also trades off faster compilation for requiring extra time at runtime to compile the kernels.
 
-To show off why you might go with this path instead of nvcc, I'll use a special kernel as an example. This kernel is the equivalent of the `as` keyword in rust: it converts between types! Notably, it has to support **every** pair of types that we might want to run with. This is super cumbersome if we go with nvcc due to generics as I'll get into later.
+To show off why you might go with this path instead of nvcc, I'll use a specific kernel as an example. This kernel is the equivalent of the `as` keyword in rust: it converts between types! Notably, it has to support **every** pair of types that we might want to run with. This is super cumbersome if we go with nvcc due to generics as I'll get into later.
 
 `nvrtc` is powerful, because we can have "pseudo" generic kernels that we compile for each type we need at runtime.
 
@@ -136,7 +148,7 @@ At runtime, we can dynamically create and load the module into Cuda like so, whe
 let module_name = std::format!("convert_{}_to_{}", E1::NAME, E2::NAME);
 if !dev.has_func(&module_name, "as_kernel") {
     let src = AS_KERNEL.replace("$Src", E1::NAME).replace("$Dst", E2::NAME);
-    let ptx = compile_ptx(src).unwrap();
+    let ptx: cudarc::nvrtc::Ptx = cudarc::nvrtc::compile_ptx(src).unwrap();
     dev.load_ptx(ptx, &module_name, &["as_kernel"])?;
 }
 ```
@@ -151,20 +163,20 @@ A number of things are going on here:
 
 Now that we know how to compile & load a PTX file into a cuda device, we can actually submit this kernel to the GPU.
 
-1. Retrieve the already loaded function:
+1. Retrieve the already loaded function with [CudaDevice::get_func()](https://docs.rs/cudarc/latest/cudarc/driver/safe/struct.CudaDevice.html#method.get_func)
     ```rust
-    let as_kernel = dev.get_func(&module_name, "as_kernel").unwrap();
+    let as_kernel: CudaFunction = dev.get_func(&module_name, "as_kernel").unwrap();
     ```
 
-2. Allocate space for output - we are specifically not setting the memory here for performance reasons and because the kernel we are about to launch will set all the memory.
+2. Allocate space for output
     ```rust
     let n: usize = inp.data.len();
-    let mut out = unsafe { dev.alloc::<E2>(n) }?;
+    let mut out: CudaSlice<E2> = dev.alloc_zeros::<E2>(n) }?;
     ```
 
 3. Configure the grid/block dimensions for cuda (the equivalent of the `<<<...>>>` in c++) & the arguments for the kernel
     ```rust
-    let cfg = launch_cfg(n as u32);
+    let cfg: LaunchConfig = LaunchConfig::for_num_elems(n as u32);
     let args = (
         n,                 // `usize` <=> `const size_t n`
         inp.data.as_ref(), // `&CudaSlice<E1>` <=> `const E1 *inp`
@@ -172,14 +184,14 @@ Now that we know how to compile & load a PTX file into a cuda device, we can act
     );
     ```
 
-4. Launch it!
+4. Launch it with [LaunchAsync::launch()](https://docs.rs/cudarc/latest/cudarc/driver/safe/trait.LaunchAsync.html#)
     ```rust
     unsafe { as_kernel.launch(cfg, args) }?;
     ```
 
 # Handling generics across FFI
 
-`dfdx` heavily uses generics everywhere, including the kernels. We also know that c++ has generics via templates. Should be easy to use on both sides (rust and c++) right? **Nope!** Since we are using FFI, we need to annotate all kernel methods with `extern "C"`. You actually [cannot use `extern "C"` together with templates](https://stackoverflow.com/questions/4877705/why-cant-templates-be-within-extern-c-blocks)!
+`dfdx` heavily uses generics everywhere, including the kernels. c++ also has generics via templates. Should be easy to use on both sides (rust and c++) right? **Nope!** Since we are using FFI, all the kernel methods need to be annotated with `extern "C"`. You actually [cannot use `extern "C"` together with templates](https://stackoverflow.com/questions/4877705/why-cant-templates-be-within-extern-c-blocks)!
 
 To be clear, you can write the following kernel, but the name of this function will be mangled because of the template, which means you won't be able to use it with ffi:
 ```c++
@@ -200,7 +212,7 @@ There are two ways to handle this:
 
 2. JIT compile a kernel with the types inserted in at runtime, which is what we did with the `as` kernel above.
 
-Those have been sufficient so far! I'm sure it will evolve more as we add more dtypes like `f16`.
+Those two options have been sufficient so far, but I'm sure it will evolve more as we add more dtypes like `f16`.
 
 # Testing
 
@@ -221,7 +233,7 @@ mod tests {
 
 As long as the unit tests are written using this TestDevice type, we can easily switch between what type of kernel we are testing. This is super useful because it forces all the unit tests to be written in a generic way, which is much closer to how I expect users to write code as well.
 
-Here's an example of the `x^2` operation:
+Here's an example of testing the `x^2` operation:
 ```rust
 #[test]
 fn test_square() {
