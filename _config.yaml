@@ -4,3 +4,8 @@ description: Blog on Deep Learning in Rust
 kramdown:
   syntax_highlighter_opts:
     disable: true
+github:
+  is_project_page: true
+  repository_name: dfdx
+  owner_name: Corey Lowman
+  repository_url: https://github.com/coreylowman/dfdx
