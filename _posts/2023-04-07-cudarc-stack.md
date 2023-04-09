@@ -17,7 +17,7 @@ GPU Acceleration with CUDA was recently added into dfdx. In this post I'll dive 
 
 # What is a CUDA kernel?
 
-Basically: a function. Behind the scenes it is executed on massively GPUs that are organized into thousands of groups of threads. Here's what a simple cuda kernel looks like in code:
+Basically: a function. Behind the scenes it is executed on massively parallel GPUs that are organized into thousands of groups of threads. Here's what a simple cuda kernel looks like in code:
 
 ```c++
 extern "C" __global__ void sin_kernel(
@@ -46,7 +46,7 @@ sin_kernel<<<12, 34>>>(12, ...)
 But since we are using rust, we can't do that. Instead we'll go through nvidia's CUDA toolkit api. There's a couple parts to this:
 
 1. Compile a cu file to a PTX file
-1. Load a PTX file with [cuModuleLoadData](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MODULE.html#group__CUDA__MODULE_1g04ce266ce03720f479eab76136b90c0b):
+1. Load a PTX file with [cuModuleLoadData](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MODULE.html#group__CUDA__MODULE_1g04ce266ce03720f479eab76136b90c0b)
 2. Retrieve a function from the module with [cuModuleGetFunction](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MODULE.html#group__CUDA__MODULE_1ga52be009b0d4045811b30c965e1cb2cf)
 3. Invoking the function with [cuLaunchKernel](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1gb8f3dc3031b40da29d5f9a7139e52e15).
 
@@ -84,23 +84,17 @@ The answer to both of these is a build script (`build.rs`)! It turns out to be q
     2. The saved file's extension will be `.ptx` (important for later).
 
     ```rust
-    kernel_paths
-        .iter()
-        .map(|kernel_path| {
-            std::process::Command::new("nvcc")
-                .arg("--ptx")
-                .arg([
-                    "--output-directory",
-                    &std::env::var("OUT_DIR").unwrap()
-                ])
-                .arg(kernel_path)
-                .spawn()
-                .unwrap()
-        })
-        .collect::<Vec<_>>()
+    std::process::Command::new("nvcc")
+        .arg("--ptx")
+        .arg([
+            "--output-directory",
+            &std::env::var("OUT_DIR").unwrap()
+        ])
+        .arg(kernel_path)
+        .spawn()
     ```
 
-That's it for compiling ptx files!
+That's it for compiling ptx files - `build.rs` makes it really easy to invoke nvcc at compile time.
 
 ### Inserting file contents into rust source code
 
@@ -118,7 +112,8 @@ Each piece of this is important, so starting from the inner most out:
 
 Finally we can use [CudaDevice::load_ptx()](https://docs.rs/cudarc/latest/cudarc/driver/safe/struct.CudaDevice.html#method.load_ptx) to invoke `cuModuleLoadData`:
 ```rust
-self.dev.load_ptx(PTX_SRC.into(), Self::MOD, Self::FNS)?;
+let ptx: cudarc::nvrtc::Ptx = PTX_SRC.into();
+self.dev.load_ptx(ptx, Self::MOD, Self::FNS)?;
 ```
 
 Now that the kernel's PTX is loaded into the device, we can call into it. But first a detour on JIT compilation.
@@ -176,7 +171,7 @@ Now that we know how to compile & load a PTX file into a cuda device, we can act
 
 3. Configure the grid/block dimensions for cuda (the equivalent of the `<<<...>>>` in c++) & the arguments for the kernel
     ```rust
-    let cfg: LaunchConfig = LaunchConfig::for_num_elems(n as u32);
+    let cfg = LaunchConfig::for_num_elems(n as u32);
     let args = (
         n,                 // `usize` <=> `const size_t n`
         inp.data.as_ref(), // `&CudaSlice<E1>` <=> `const E1 *inp`
